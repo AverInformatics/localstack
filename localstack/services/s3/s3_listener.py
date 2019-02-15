@@ -124,7 +124,7 @@ def queue_url_for_arn(queue_arn):
 
 
 def send_notifications(method, bucket_name, object_path):
-    for bucket, config in iteritems(S3_NOTIFICATIONS):
+    for bucket, configs in iteritems(S3_NOTIFICATIONS):
         if bucket == bucket_name:
             action = {'PUT': 'ObjectCreated', 'POST': 'ObjectCreated', 'DELETE': 'ObjectRemoved'}[method]
             # TODO: support more detailed methods, e.g., DeleteMarkerCreated
@@ -135,44 +135,45 @@ def send_notifications(method, bucket_name, object_path):
                 api_method = {'PUT': 'Put', 'POST': 'Post', 'DELETE': 'Delete'}[method]
 
             event_name = '%s:%s' % (action, api_method)
-            if (event_type_matches(config['Event'], action, api_method) and
-                    filter_rules_match(config.get('Filter'), object_path)):
-                # send notification
-                message = get_event_message(
-                    event_name=event_name, bucket_name=bucket_name,
-                    file_name=urlparse.urlparse(object_path[1:]).path
-                )
-                message = json.dumps(message)
-                if config.get('Queue'):
-                    sqs_client = aws_stack.connect_to_service('sqs')
-                    try:
-                        queue_url = queue_url_for_arn(config['Queue'])
-                        sqs_client.send_message(QueueUrl=queue_url, MessageBody=message)
-                    except Exception as e:
-                        LOGGER.warning('Unable to send notification for S3 bucket "%s" to SQS queue "%s": %s' %
-                            (bucket_name, config['Queue'], e))
-                if config.get('Topic'):
-                    sns_client = aws_stack.connect_to_service('sns')
-                    try:
-                        sns_client.publish(TopicArn=config['Topic'], Message=message, Subject='Amazon S3 Notification')
-                    except Exception:
-                        LOGGER.warning('Unable to send notification for S3 bucket "%s" to SNS topic "%s".' %
-                            (bucket_name, config['Topic']))
-                # CloudFunction and LambdaFunction are semantically identical
-                lambda_function_config = config.get('CloudFunction') or config.get('LambdaFunction')
-                if lambda_function_config:
-                    # make sure we don't run into a socket timeout
-                    connection_config = botocore.config.Config(read_timeout=300)
-                    lambda_client = aws_stack.connect_to_service('lambda', config=connection_config)
-                    try:
-                        lambda_client.invoke(FunctionName=lambda_function_config,
-                                             InvocationType='Event', Payload=message)
-                    except Exception:
-                        LOGGER.warning('Unable to send notification for S3 bucket "%s" to Lambda function "%s".' %
-                            (bucket_name, lambda_function_config))
-                if not filter(lambda x: config.get(x), NOTIFICATION_DESTINATION_TYPES):
-                    LOGGER.warning('Neither of %s defined for S3 notification.' %
-                        '/'.join(NOTIFICATION_DESTINATION_TYPES))
+            for config in configs:
+                if (event_type_matches(config['Event'], action, api_method) and
+                        filter_rules_match(config.get('Filter'), object_path)):
+                    # send notification
+                    message = get_event_message(
+                        event_name=event_name, bucket_name=bucket_name,
+                        file_name=urlparse.urlparse(object_path[1:]).path
+                    )
+                    message = json.dumps(message)
+                    if config.get('Queue'):
+                        sqs_client = aws_stack.connect_to_service('sqs')
+                        try:
+                            queue_url = queue_url_for_arn(config['Queue'])
+                            sqs_client.send_message(QueueUrl=queue_url, MessageBody=message)
+                        except Exception as e:
+                            LOGGER.warning('Unable to send notification for S3 bucket "%s" to SQS queue "%s": %s' %
+                                (bucket_name, config['Queue'], e))
+                    if config.get('Topic'):
+                        sns_client = aws_stack.connect_to_service('sns')
+                        try:
+                            sns_client.publish(TopicArn=config['Topic'], Message=message, Subject='Amazon S3 Notification')
+                        except Exception:
+                            LOGGER.warning('Unable to send notification for S3 bucket "%s" to SNS topic "%s".' %
+                                (bucket_name, config['Topic']))
+                    # CloudFunction and LambdaFunction are semantically identical
+                    lambda_function_config = config.get('CloudFunction') or config.get('LambdaFunction')
+                    if lambda_function_config:
+                        # make sure we don't run into a socket timeout
+                        connection_config = botocore.config.Config(read_timeout=300)
+                        lambda_client = aws_stack.connect_to_service('lambda', config=connection_config)
+                        try:
+                            lambda_client.invoke(FunctionName=lambda_function_config,
+                                                 InvocationType='Event', Payload=message)
+                        except Exception:
+                            LOGGER.warning('Unable to send notification for S3 bucket "%s" to Lambda function "%s".' %
+                                (bucket_name, lambda_function_config))
+                    if not filter(lambda x: config.get(x), NOTIFICATION_DESTINATION_TYPES):
+                        LOGGER.warning('Neither of %s defined for S3 notification.' %
+                            '/'.join(NOTIFICATION_DESTINATION_TYPES))
 
 
 def get_cors(bucket_name):
@@ -366,18 +367,19 @@ def handle_notification_request(bucket, method, data):
         # TODO check if bucket exists
         result = '<NotificationConfiguration xmlns="%s">' % XMLNS_S3
         if bucket in S3_NOTIFICATIONS:
-            notif = S3_NOTIFICATIONS[bucket]
-            for dest in NOTIFICATION_DESTINATION_TYPES:
-                if dest in notif:
-                    dest_dict = {
-                        '%sConfiguration' % dest: {
-                            'Id': uuid.uuid4(),
-                            dest: notif[dest],
-                            'Event': notif['Event'],
-                            'Filter': notif['Filter']
+            notifs = S3_NOTIFICATIONS[bucket]
+            for notif in notifs:
+                for dest in NOTIFICATION_DESTINATION_TYPES:
+                    if dest in notif:
+                        dest_dict = {
+                            '%sConfiguration' % dest: {
+                                'Id': uuid.uuid4(),
+                                dest: notif[dest],
+                                'Event': notif['Event'],
+                                'Filter': notif['Filter']
+                            }
                         }
-                    }
-                    result += xmltodict.unparse(dest_dict, full_document=False)
+                        result += xmltodict.unparse(dest_dict, full_document=False)
         result += '</NotificationConfiguration>'
         response._content = result
 
@@ -385,26 +387,30 @@ def handle_notification_request(bucket, method, data):
         parsed = xmltodict.parse(data)
         notif_config = parsed.get('NotificationConfiguration')
         S3_NOTIFICATIONS.pop(bucket, None)
+        config_list = []
         for dest in NOTIFICATION_DESTINATION_TYPES:
-            config = notif_config.get('%sConfiguration' % (dest))
-            if config:
-                events = config.get('Event')
-                if isinstance(events, six.string_types):
-                    events = [events]
-                event_filter = config.get('Filter', {})
-                # make sure FilterRule is an array
-                s3_filter = _get_s3_filter(event_filter)
-                if s3_filter and not isinstance(s3_filter.get('FilterRule', []), list):
-                    s3_filter['FilterRule'] = [s3_filter['FilterRule']]
-                # create final details dict
-                notification_details = {
-                    'Id': config.get('Id'),
-                    'Event': events,
-                    dest: config.get(dest),
-                    'Filter': event_filter
-                }
-                # TODO: what if we have multiple destinations - would we overwrite the config?
-                S3_NOTIFICATIONS[bucket] = clone(notification_details)
+            configs = notif_config.get('%sConfiguration' % (dest))
+            if configs:
+                if not isinstance(configs, list):
+                    configs = [configs]
+                for config in configs:
+                    events = config.get('Event')
+                    if isinstance(events, six.string_types):
+                        events = [events]
+                    event_filter = config.get('Filter', {})
+                    # make sure FilterRule is an array
+                    s3_filter = _get_s3_filter(event_filter)
+                    if s3_filter and not isinstance(s3_filter.get('FilterRule', []), list):
+                        s3_filter['FilterRule'] = [s3_filter['FilterRule']]
+                    # create final details dict
+                    notification_details = {
+                        'Id': config.get('Id'),
+                        'Event': events,
+                        dest: config.get(dest),
+                        'Filter': event_filter
+                    }
+                    config_list.append(clone(notification_details))
+        S3_NOTIFICATIONS[bucket] = config_list
     return response
 
 
